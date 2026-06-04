@@ -1,3 +1,3 @@
-from regdna_bench.base import BenchmarkModel
+from regdna_bench.base import BenchModel
 
-__all__ = ["BenchmarkModel"]
+__all__ = ["BenchModel"]

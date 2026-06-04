@@ -12,8 +12,10 @@ not autoregressive, so two D3-specific choices are made here and documented:
   transformer block. add_last_layer_embedding_extraction() installs the hook;
   the result is read from .last_layer_embedding after each forward().
 
-the D3 backbone (d3_dna) is imported lazily inside from_pretrained so the rest
-of the benchmark does not depend on the D3 environment.
+the only thing a caller must provide is a checkpoint: from_pretrained reads the
+config embedded in the checkpoint and derives the probing noise level from the
+model's own schedule. the D3 backbone (d3_dna) is imported lazily so the rest of
+the benchmark does not depend on the D3 environment.
 """
 
 from __future__ import annotations
@@ -22,46 +24,81 @@ import torch
 
 from regdna_bench.base import BenchModel
 
-# precision: D3 samples under fp16 autocast, but embeddings and any probe-side
-# reductions are kept in fp32 to avoid instability when fitting linear probes.
-INFERENCE_DTYPE = torch.float16
+# embeddings and the ridge probe are kept in fp32; extraction runs under
+# no_grad in fp32 (no autocast) for stability, even though D3 samples in fp16.
 EMBED_DTYPE = torch.float32
 
 _DNA = ("A", "C", "G", "T")
 _CHAR_TO_TOK = {c: i for i, c in enumerate(_DNA)}
 
 
+# config lives inside PL checkpoints under hyper_parameters.cfg, so callers can
+# pass just a checkpoint. a path or an already-loaded OmegaConf still override it.
+def _resolve_config(checkpoint, config, device):
+    from omegaconf import OmegaConf
+
+    if config is not None:
+        return OmegaConf.load(config) if isinstance(config, str) else config
+
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    hyper = ckpt.get("hyper_parameters", {}) if isinstance(ckpt, dict) else {}
+
+    if "cfg" not in hyper:
+        raise ValueError("no config given and checkpoint has no embedded cfg; pass config explicitly")
+
+    return OmegaConf.create(dict(hyper["cfg"]))
+
+
 class D3Model(BenchModel):
     """benchmark wrapper around a loaded D3 TransformerModel (DDiT backbone)."""
 
-    def __init__(self, model, config, device="cuda", default_sigma=0.02):
+    def __init__(self, model, config, noise=None, device="cuda", default_sigma=None):
         self._model = model.to(device).eval()
         self._config = config
+        self._noise = noise
         self._device = device
 
         # diffusion forward needs a noise level; autoregressive models would not.
-        # a single fixed sigma matches the D3 lentiMPRA probing setup.
+        # derive it from the model's own schedule unless caller pins one.
+        if default_sigma is None:
+            if noise is None:
+                raise ValueError("provide default_sigma, or a noise schedule to derive it from")
+            default_sigma = self._canonical_sigma()
         self._default_sigma = default_sigma
 
         self._last_layer_embedding = None
         self._hook_handle = None
 
     @classmethod
-    def from_pretrained(cls, checkpoint, config, device="cuda", default_sigma=0.02):
-        from omegaconf import OmegaConf
+    def from_pretrained(cls, checkpoint, config=None, device="cuda", default_sigma=None):
         from d3_dna.models import TransformerModel
         from d3_dna.modules.checkpoint import load_checkpoint
 
-        cfg = OmegaConf.load(config) if isinstance(config, str) else config
+        cfg = _resolve_config(checkpoint, config, device)
 
         model = TransformerModel(cfg)
-        # load_checkpoint applies EMA weights and preserves checkpoint precision
-        model, _graph, _noise = load_checkpoint(checkpoint, model=model, config=cfg, device=device)
+        # load_checkpoint applies EMA weights and returns the noise schedule we
+        # need to pick the probing sigma
+        model, _graph, noise = load_checkpoint(checkpoint, model=model, config=cfg, device=device)
         model.eval()
 
-        return cls(model, cfg, device=device, default_sigma=default_sigma)
+        return cls(model, cfg, noise=noise, device=device, default_sigma=default_sigma)
 
-    # accepts ACGT strings, (B, L) token ids, or (B, L, 4) one-hot
+    # matches the lentiMPRA VEP default: read the 5th-from-last (low-noise) sigma
+    # of the geometric schedule, so embeddings come from near the clean end of
+    # the diffusion trajectory.
+    def _canonical_sigma(self):
+        steps = int(self._config.sampling.steps) if hasattr(self._config, "sampling") else 128
+        eps = 1e-5
+
+        timesteps = torch.linspace(1.0, eps, steps + 1, device=self._device)
+        sigmas = self._noise.total_noise(timesteps)
+
+        idx = max(0, len(sigmas) - 5)
+
+        return float(sigmas[idx].item())
+
+    # accepts ACGT strings, numpy/torch (B, L) token ids, or (B, L, 4) one-hot
     def _to_tokens(self, sequence):
         if isinstance(sequence, str):
             sequence = [sequence]
@@ -72,7 +109,7 @@ class D3Model(BenchModel):
                 dtype=torch.long, device=self._device,
             )
 
-        tokens = sequence
+        tokens = torch.as_tensor(sequence)
         if tokens.dim() == 3:
             tokens = tokens.argmax(dim=-1)
 
