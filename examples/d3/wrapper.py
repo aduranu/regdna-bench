@@ -24,8 +24,10 @@ import torch
 
 from regdna_bench.base import BenchModel
 
-# embeddings and the ridge probe are kept in fp32; extraction runs under
-# no_grad in fp32 (no autocast) for stability, even though D3 samples in fp16.
+# embeddings and the ridge probe are kept in fp32; the captured block output is
+# cast to fp32 in the hook. the denoising pass itself runs under fp16 autocast on
+# cuda (see _denoise) to match D3's native inference and satisfy flash-attn,
+# which only accepts fp16/bf16. LayerNorm and rotary force fp32 internally.
 EMBED_DTYPE = torch.float32
 
 _DNA = ("A", "C", "G", "T")
@@ -52,11 +54,17 @@ def _resolve_config(checkpoint, config, device):
 class D3Model(BenchModel):
     """benchmark wrapper around a loaded D3 TransformerModel (DDiT backbone)."""
 
-    def __init__(self, model, config, noise=None, device="cuda", default_sigma=None):
+    def __init__(self, model, config, noise=None, device="cuda", default_sigma=None,
+                 token_offset=0):
         self._model = model.to(device).eval()
         self._config = config
         self._noise = noise
         self._device = device
+
+        # token_offset maps acgt one-hot channels (0..3) onto the model's own
+        # vocab: 0 for the lentimpra/k562 models (0=A..3=T), 1 for zoonomia
+        # (0=N, 1=A..4=T).
+        self._token_offset = token_offset
 
         # diffusion forward needs a noise level; autoregressive models would not.
         # derive it from the model's own schedule unless caller pins one.
@@ -70,7 +78,8 @@ class D3Model(BenchModel):
         self._hook_handle = None
 
     @classmethod
-    def from_pretrained(cls, checkpoint, config=None, device="cuda", default_sigma=None):
+    def from_pretrained(cls, checkpoint, config=None, device="cuda", default_sigma=None,
+                        token_offset=0):
         from d3_dna.models import TransformerModel
         from d3_dna.modules.checkpoint import load_checkpoint
 
@@ -82,7 +91,8 @@ class D3Model(BenchModel):
         model, _graph, noise = load_checkpoint(checkpoint, model=model, config=cfg, device=device)
         model.eval()
 
-        return cls(model, cfg, noise=noise, device=device, default_sigma=default_sigma)
+        return cls(model, cfg, noise=noise, device=device, default_sigma=default_sigma,
+                   token_offset=token_offset)
 
     # matches the lentiMPRA VEP default: read the 5th-from-last (low-noise) sigma
     # of the geometric schedule, so embeddings come from near the clean end of
@@ -98,20 +108,22 @@ class D3Model(BenchModel):
 
         return float(sigmas[idx].item())
 
-    # accepts ACGT strings, numpy/torch (B, L) token ids, or (B, L, 4) one-hot
+    # accepts ACGT strings, numpy/torch (B, L) token ids, or (B, L, 4) one-hot.
+    # token_offset shifts acgt onto the model's vocab; pre-tokenized (B, L) ids
+    # are assumed already in the model's convention and left as-is.
     def _to_tokens(self, sequence):
         if isinstance(sequence, str):
             sequence = [sequence]
 
         if isinstance(sequence, (list, tuple)):
             return torch.tensor(
-                [[_CHAR_TO_TOK[c] for c in s] for s in sequence],
+                [[_CHAR_TO_TOK[c] + self._token_offset for c in s] for s in sequence],
                 dtype=torch.long, device=self._device,
             )
 
         tokens = torch.as_tensor(sequence)
         if tokens.dim() == 3:
-            tokens = tokens.argmax(dim=-1)
+            tokens = tokens.argmax(dim=-1) + self._token_offset
 
         return tokens.to(self._device).long()
 
@@ -127,17 +139,24 @@ class D3Model(BenchModel):
     def _capture_hook(self, _module, _inputs, output):
         self._last_layer_embedding = output.detach().to(EMBED_DTYPE)
 
-    def forward(self, sequence):
+    # single denoising pass shared by forward()/predict_logits(). fp16 autocast on
+    # cuda matches D3's native inference precision and keeps flash-attn (fp16/bf16
+    # only) happy; on cpu it runs fp32 via the SDPA fallback.
+    def _denoise(self, sequence):
         tokens = self._to_tokens(sequence)
         sigma = self._sigma_for(tokens.shape[0])
 
-        with torch.no_grad():
+        use_amp = tokens.is_cuda
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
             logits, _rep = self._model(tokens, None, train=False, sigma=sigma)
 
+        return logits
+
+    def forward(self, sequence):
         # contract: return a generated sequence. for diffusion this is the
         # single-step denoised prediction; use predict_logits for a continuous
         # variant-effect score.
-        return logits.argmax(dim=-1)
+        return self._denoise(sequence).argmax(dim=-1)
 
     def add_last_layer_embedding_extraction(self):
         if self._hook_handle is not None:
@@ -156,10 +175,4 @@ class D3Model(BenchModel):
     # rather than forward()'s argmax tokens, since the diffusion model has no
     # autoregressive likelihood to compare ref vs alt alleles directly.
     def predict_logits(self, sequence):
-        tokens = self._to_tokens(sequence)
-        sigma = self._sigma_for(tokens.shape[0])
-
-        with torch.no_grad():
-            logits, _rep = self._model(tokens, None, train=False, sigma=sigma)
-
-        return logits
+        return self._denoise(sequence)
