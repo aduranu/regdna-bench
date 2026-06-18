@@ -1,0 +1,9 @@
+# secrets
+.env
+
+# downloaded datasets and run outputs
+/data/
+
+# python
+__pycache__/
+*.pyc
