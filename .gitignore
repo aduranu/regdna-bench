@@ -3,6 +3,8 @@
 
 # downloaded datasets and run outputs
 /data/
+/results/
+/sbatch_out/
 
 # python
 __pycache__/

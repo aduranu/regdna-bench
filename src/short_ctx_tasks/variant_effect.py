@@ -1,11 +1,15 @@
-"""task 5: variant effect prediction (zero-shot, embedding-based).
+"""task 5: variant effect prediction (zero-shot).
 
 scores how a variant changes regulatory activity from paired reference/alternate
-allele sequences (caQTL / dsQTL data). the score is the cosine distance between
-mean-pooled ref/alt last-layer embeddings: a good model puts a larger distance on
-significant variants (real QTLs) than on background variants (SNPs in accessible
-peaks that do not affect accessibility).
+allele sequences (caQTL / dsQTL data). two zero-shot methods, matching DART-Eval:
 
+- embedding-based: cosine distance between mean-pooled ref/alt last-layer
+  embeddings (uses only the BenchModel embedding hook).
+- likelihood-based: the allele log-likelihood difference read from the model's
+  per-position scores (requires the model to expose predict_logits).
+
+a good model puts a larger score on significant variants (real QTLs) than on
+background variants (SNPs in accessible peaks that do not affect accessibility).
 results are reported overall and stratified by host CRE class. headline metric is
 auroc/auprc (significant vs background); spearman vs |effect size| is secondary.
 """
@@ -18,6 +22,7 @@ import torch
 from short_ctx_tasks.scoring import (
     classification_metrics,
     correlation_metrics,
+    extract_allele_score_difference,
     extract_embeddings,
 )
 
@@ -122,5 +127,72 @@ def run_variant_zero_shot_by_class(model, ref_seqs, alt_seqs, cre_classes,
         scored += 1
 
     print(f"variant zero-shot by class complete: {scored} classes scored, {skipped} skipped")
+
+    return results
+
+
+def run_variant_zero_shot_likelihood(model, windows, offsets, ref_tokens, alt_tokens,
+                                     effect_sizes=None, labels=None, batch_size=256,
+                                     verbose=True):
+    # allele log-likelihood difference from the model's per-position scores. the
+    # signed value can carry effect direction; |llr| is the significance score,
+    # mirroring the unsigned cosine distance of the embedding method.
+    llr = extract_allele_score_difference(
+        model, windows, offsets, ref_tokens, alt_tokens, batch_size=batch_size,
+    )
+    score = np.abs(llr)
+
+    results = {"score": llr, "abs_score": score}
+
+    if effect_sizes is not None or labels is not None:
+        results["metrics"] = _variant_metrics(score, effect_sizes, labels)
+
+    # verbose is off when called per-class, so the wrapper prints one summary
+    if verbose:
+        print("variant zero-shot likelihood complete")
+
+    return results
+
+
+def run_variant_zero_shot_likelihood_by_class(model, windows, offsets, ref_tokens,
+                                              alt_tokens, cre_classes,
+                                              effect_sizes=None, labels=None,
+                                              batch_size=256, min_per_class=10):
+    # likelihood counterpart of run_variant_zero_shot_by_class: same stratify +
+    # skip-sparse + single-label-guard logic, scoring with the allele llr instead
+    # of the embedding cosine distance.
+    overall = run_variant_zero_shot_likelihood(
+        model, windows, offsets, ref_tokens, alt_tokens,
+        effect_sizes=effect_sizes, labels=labels, batch_size=batch_size, verbose=False,
+    )
+    overall["n"] = len(windows)
+
+    results = {"overall": overall}
+    groups = _group_indices_by_class(cre_classes)
+
+    scored, skipped = 0, 0
+    for cls, idx in groups.items():
+        n = len(idx)
+
+        if n < min_per_class:
+            results[cls] = {"n": n, "skipped": f"fewer than {min_per_class} variants"}
+            skipped += 1
+            continue
+
+        cls_labels = _subset(labels, idx)
+        if cls_labels is not None and len(np.unique(np.asarray(cls_labels))) < 2:
+            cls_labels = None
+
+        cls_result = run_variant_zero_shot_likelihood(
+            model, _subset(windows, idx), _subset(offsets, idx),
+            _subset(ref_tokens, idx), _subset(alt_tokens, idx),
+            effect_sizes=_subset(effect_sizes, idx), labels=cls_labels,
+            batch_size=batch_size, verbose=False,
+        )
+        cls_result["n"] = n
+        results[cls] = cls_result
+        scored += 1
+
+    print(f"variant zero-shot likelihood by class complete: {scored} classes scored, {skipped} skipped")
 
     return results
