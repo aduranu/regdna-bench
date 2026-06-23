@@ -27,44 +27,22 @@ from short_ctx_tasks.scoring import (
 )
 
 
-def _variant_metrics(distance, effect_sizes, labels):
-    # cosine distance is unsigned: it correlates with |effect size| and doubles
-    # as the significance score for the sig-vs-background classification.
+def variant_metrics(score, effect_sizes, labels):
+    # the score is unsigned: it correlates with |effect size| and doubles as the
+    # significance score for the sig-vs-background classification.
     entry = {}
 
     if effect_sizes is not None:
         target = np.abs(np.asarray(effect_sizes, dtype=np.float64))
-        entry["correlation"] = correlation_metrics(distance, target)
+        entry["correlation"] = correlation_metrics(score, target)
 
     if labels is not None:
-        entry["classification"] = classification_metrics(distance, labels)
+        entry["classification"] = classification_metrics(score, labels)
 
     return entry
 
 
-def run_variant_zero_shot_embedding(model, ref_seqs, alt_seqs,
-                                    effect_sizes=None, labels=None, batch_size=256,
-                                    verbose=True):
-    # cosine distance between mean-pooled ref/alt embeddings.
-    ref_emb = extract_embeddings(model, ref_seqs, batch_size=batch_size)
-    alt_emb = extract_embeddings(model, alt_seqs, batch_size=batch_size)
-
-    cos = torch.nn.functional.cosine_similarity(ref_emb, alt_emb, dim=1)
-    distance = (1.0 - cos).numpy()
-
-    results = {"cosine_distance": distance}
-
-    if effect_sizes is not None or labels is not None:
-        results["metrics"] = _variant_metrics(distance, effect_sizes, labels)
-
-    # verbose is off when called per-class, so the wrapper prints one summary
-    if verbose:
-        print("variant zero-shot embedding complete")
-
-    return results
-
-
-def _group_indices_by_class(cre_classes):
+def group_indices_by_class(cre_classes):
     # {class label: [row indices]}, preserving first-seen order so per-class
     # slices stay aligned with the input arrays.
     groups = {}
@@ -86,13 +64,34 @@ def _subset(values, idx):
     return values[idx]
 
 
+def run_variant_zero_shot_embedding(model, ref_seqs, alt_seqs,
+                                    effect_sizes=None, labels=None, batch_size=256,
+                                    verbose=True):
+    # cosine distance between mean-pooled ref/alt embeddings.
+    ref_emb = extract_embeddings(model, ref_seqs, batch_size=batch_size)
+    alt_emb = extract_embeddings(model, alt_seqs, batch_size=batch_size)
+
+    cos = torch.nn.functional.cosine_similarity(ref_emb, alt_emb, dim=1)
+    distance = (1.0 - cos).numpy()
+
+    results = {"cosine_distance": distance}
+
+    if effect_sizes is not None or labels is not None:
+        results["metrics"] = variant_metrics(distance, effect_sizes, labels)
+
+    # verbose is off when called per-class, so the wrapper prints one summary
+    if verbose:
+        print("variant zero-shot embedding complete")
+
+    return results
+
+
 def run_variant_zero_shot_by_class(model, ref_seqs, alt_seqs, cre_classes,
                                    effect_sizes=None, labels=None, batch_size=256,
                                    min_per_class=10):
     # stratifies the embedding variant score by host CRE class (plus an overall
     # entry). per-class auroc/auprc shows where the generative prior captures
-    # functional variant effects; restricting to D3's cCRE classes keeps the
-    # eval in-distribution. sparse classes are skipped rather than reported noisy.
+    # functional variant effects. sparse classes are skipped, not reported noisy.
     overall = run_variant_zero_shot_embedding(
         model, ref_seqs, alt_seqs, effect_sizes=effect_sizes, labels=labels,
         batch_size=batch_size, verbose=False,
@@ -100,7 +99,7 @@ def run_variant_zero_shot_by_class(model, ref_seqs, alt_seqs, cre_classes,
     overall["n"] = len(ref_seqs)
 
     results = {"overall": overall}
-    groups = _group_indices_by_class(cre_classes)
+    groups = group_indices_by_class(cre_classes)
 
     scored, skipped = 0, 0
     for cls, idx in groups.items():
@@ -145,9 +144,8 @@ def run_variant_zero_shot_likelihood(model, windows, offsets, ref_tokens, alt_to
     results = {"score": llr, "abs_score": score}
 
     if effect_sizes is not None or labels is not None:
-        results["metrics"] = _variant_metrics(score, effect_sizes, labels)
+        results["metrics"] = variant_metrics(score, effect_sizes, labels)
 
-    # verbose is off when called per-class, so the wrapper prints one summary
     if verbose:
         print("variant zero-shot likelihood complete")
 
@@ -168,7 +166,7 @@ def run_variant_zero_shot_likelihood_by_class(model, windows, offsets, ref_token
     overall["n"] = len(windows)
 
     results = {"overall": overall}
-    groups = _group_indices_by_class(cre_classes)
+    groups = group_indices_by_class(cre_classes)
 
     scored, skipped = 0, 0
     for cls, idx in groups.items():

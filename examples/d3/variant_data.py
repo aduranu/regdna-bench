@@ -1,9 +1,10 @@
 """shared data assembly for the zero-shot variant-effect runners.
 
-reads element-anchored 350bp ref/alt token windows for caQTL variants straight
-from the Zoonomia uint8 token store (not a FASTA), so sequences are native
-5-token ids {N:0,A:1,C:2,G:3,T:4} and match how D3 was trained: window = cCRE
-midpoint +/-175, N-padded at chrom edges, human species_index 0.
+reads 350bp ref/alt token windows for caQTL variants straight from the Zoonomia
+uint8 token store (not a FASTA), so sequences are native 5-token ids
+{N:0,A:1,C:2,G:3,T:4} and match how D3 was trained. windows are N-padded only at
+chromosome edges, human species_index 0. assemble() supports two anchorings via
+window_mode: cCRE-midpoint ("element") or variant-centered ("variant").
 
 both the embedding and likelihood runners share this; the embedding method uses
 the ref/alt windows, the likelihood method additionally uses the per-variant
@@ -21,7 +22,7 @@ import numpy as np
 
 # native zoonomia tokenization (N=0); windows read from the store are already
 # these ids, so we only need the map to substitute the alt allele.
-_BASE_TO_TOK = {"A": 1, "C": 2, "G": 3, "T": 4}
+BASE_TO_TOK = {"A": 1, "C": 2, "G": 3, "T": 4}
 SEQ_LEN = 350
 HALF = SEQ_LEN // 2
 SPECIES_INDEX = 0
@@ -56,8 +57,8 @@ def open_genome(zarr_path, h5_path, chroms):
     return mode, handle, lengths
 
 
-def _read_window(handle, chrom, lo, hi, chrom_len):
-    # single-species window with N-padding (token 0) past chromosome edges.
+def read_window(handle, chrom, lo, hi, chrom_len):
+    # single-species window; N (token 0) only where it runs past a chromosome edge.
     lo_clip = max(lo, 0)
     hi_clip = min(hi, chrom_len)
 
@@ -108,7 +109,7 @@ def load_ccre_intervals(bed_path, chroms):
     return intervals
 
 
-def _find_containing_ccre(intervals, chrom, pos0):
+def find_containing_ccre(intervals, chrom, pos0):
     # cCREs are non-overlapping; the candidate is the rightmost start <= pos0.
     # check it and its left neighbor to be safe against adjacency.
     if chrom not in intervals:
@@ -125,15 +126,14 @@ def _find_containing_ccre(intervals, chrom, pos0):
 
 
 def assemble(variants, intervals, handle, chrom_lengths, window_mode="element"):
-    # turn caQTL rows into 350bp ref/alt token windows + labels. also returns the
-    # per-variant offset and ref/alt token ids, which the likelihood method needs
-    # (the embedding method only uses ref/alt windows). the containing cCRE is
-    # always looked up: it assigns the per-class label and keeps the variant set
-    # identical across window modes. window_mode controls where the window sits:
+    # turn caQTL rows into 350bp ref/alt token windows + labels, plus the
+    # per-variant offset and ref/alt token ids (needed by the likelihood method).
+    # the containing cCRE is always looked up: it assigns the per-class label and
+    # keeps the variant set identical across window modes. window_mode controls
+    # where the window sits:
     #   "element" -> cCRE midpoint +/-175 (D3-native; variant off-center)
-    #   "variant" -> variant +/-175 (variant always at index 175). flanks pull in
-    #                real genomic sequence beyond the cCRE; _read_window N-pads only
-    #                where the window runs off a chromosome edge.
+    #   "variant" -> variant +/-175 (variant at index 175); flanks pull in real
+    #                genomic sequence beyond the cCRE, N only at chromosome edges.
     if window_mode not in ("element", "variant"):
         raise ValueError(f"unknown window_mode {window_mode!r}")
 
@@ -142,11 +142,11 @@ def assemble(variants, intervals, handle, chrom_lengths, window_mode="element"):
     drops = Counter()
 
     for chrom, pos, a1, a2, label, beta in variants:
-        if len(a1) != 1 or len(a2) != 1 or a1 not in _BASE_TO_TOK or a2 not in _BASE_TO_TOK:
+        if len(a1) != 1 or len(a2) != 1 or a1 not in BASE_TO_TOK or a2 not in BASE_TO_TOK:
             drops["not_snp"] += 1
             continue
 
-        hit = _find_containing_ccre(intervals, chrom, pos)
+        hit = find_containing_ccre(intervals, chrom, pos)
         if hit is None:
             drops["no_ccre"] += 1
             continue
@@ -167,16 +167,15 @@ def assemble(variants, intervals, handle, chrom_lengths, window_mode="element"):
                 drops["out_of_window"] += 1
                 continue
 
-        window = _read_window(handle, chrom, lo, lo + SEQ_LEN, chrom_lengths[chrom])
+        window = read_window(handle, chrom, lo, lo + SEQ_LEN, chrom_lengths[chrom])
         genome_tok = int(window[off])
 
         # the genome holds one of the two alleles (the ref); the other is the alt
-        # substitution. cosine distance is symmetric, so this orientation only
-        # matters for the (signed) likelihood readout.
-        if genome_tok == _BASE_TO_TOK[a1]:
-            other = _BASE_TO_TOK[a2]
-        elif genome_tok == _BASE_TO_TOK[a2]:
-            other = _BASE_TO_TOK[a1]
+        # substitution. orientation only matters for the signed likelihood readout.
+        if genome_tok == BASE_TO_TOK[a1]:
+            other = BASE_TO_TOK[a2]
+        elif genome_tok == BASE_TO_TOK[a2]:
+            other = BASE_TO_TOK[a1]
         else:
             drops["ref_mismatch"] += 1
             continue

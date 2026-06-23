@@ -1,8 +1,8 @@
 """runner: zero-shot variant-effect prediction per CRE class, for D3.
 
-assembles 350bp element-anchored ref/alt windows for African caQTL variants and
-scores them with one of the two zero-shot methods, reporting auroc/auprc
-(significant vs background) overall and per cCRE class:
+assembles 350bp ref/alt windows for African caQTL variants and scores them with
+one of the two zero-shot methods, reporting auroc/auprc (significant vs
+background) overall and per cCRE class:
 
 - embedding: cosine distance between mean-pooled ref/alt embeddings.
 - likelihood: allele log-likelihood difference from the model's per-position
@@ -10,7 +10,7 @@ scores them with one of the two zero-shot methods, reporting auroc/auprc
 
 usage:
     PYTHONPATH=src python examples/d3/run_variant_vep_by_class.py \
-        --variants /path/to/Afr.CaQTLS.tsv --method likelihood
+        --variants /path/to/Afr.CaQTLS.tsv --method likelihood --window-mode variant
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ import sys
 # src/ holds regdna_bench + short_ctx_tasks; this dir holds the d3 wrapper and the
 # shared variant_data module. done before project imports since the repo ships no
 # installable package.
-_REPO = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_REPO / "src"))
+REPO = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import pandas as pd  # noqa: E402
@@ -51,7 +51,7 @@ COL_LABEL = "label"
 COL_BETA = "beta"
 
 
-def _serializable(results):
+def summarize(results):
     # strip the raw per-variant score arrays so the summary is json-dumpable.
     out = {}
     for key, entry in results.items():
@@ -63,8 +63,8 @@ def _serializable(results):
     return out
 
 
-def _print_summary(results, drops):
-    summary = _serializable(results)
+def print_summary(results, drops):
+    summary = summarize(results)
 
     print("drop reasons:", dict(drops))
     for key in ["overall"] + sorted(k for k in summary if k != "overall"):
@@ -82,7 +82,7 @@ def _print_summary(results, drops):
         print(line)
 
 
-def _score(method, model, data, min_per_class):
+def run_method(method, model, data, min_per_class):
     # dispatch to the chosen zero-shot method; both report identical metric keys.
     if method == "embedding":
         return run_variant_zero_shot_by_class(
@@ -140,15 +140,15 @@ def main():
 
     model = D3Model.from_pretrained(args.checkpoint, device=args.device)
 
-    results = _score(args.method, model, data, args.min_per_class)
+    results = run_method(args.method, model, data, args.min_per_class)
 
-    _print_summary(results, drops)
+    print_summary(results, drops)
 
     if args.out is not None:
         with open(args.out, "w") as handle_out:
             json.dump({"method": args.method, "window_mode": args.window_mode,
                        "genome_backend": mode, "drops": dict(drops),
-                       "results": _serializable(results)},
+                       "results": summarize(results)},
                       handle_out, indent=2)
 
 

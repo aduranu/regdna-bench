@@ -31,8 +31,8 @@ from regdna_bench.base import BenchModel
 # precision policy). captured embeddings/logits are cast back to fp32 here.
 EMBED_DTYPE = torch.float32
 
-_DNA = ("A", "C", "G", "T")
-_CHAR_TO_TOK = {c: i for i, c in enumerate(_DNA)}
+DNA = ("A", "C", "G", "T")
+CHAR_TO_TOK = {c: i for i, c in enumerate(DNA)}
 
 
 # config lives inside PL checkpoints under hyper_parameters.cfg, so callers can
@@ -119,7 +119,7 @@ class D3Model(BenchModel):
 
         if isinstance(sequence, (list, tuple)):
             return torch.tensor(
-                [[_CHAR_TO_TOK[c] for c in s] for s in sequence],
+                [[CHAR_TO_TOK[c] for c in s] for s in sequence],
                 dtype=torch.long, device=self._device,
             )
 
