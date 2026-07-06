@@ -80,9 +80,6 @@ def _load_checkpoint(...):
     ...
 ```
 
-- Default to private unless a function is intended for use outside the module.
-- Do not expose helpers "just in case".
-
 ---
 
 ## 6. Abstract Classes

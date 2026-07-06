@@ -1,50 +1,81 @@
-"""Abstract model interface for the regdna-bench benchmark.
+"""Model interfaces for the regdna-bench benchmark.
 
-A benchmark "model" is anything that can (a) generate DNA sequence and
-(b) expose its last-layer embeddings. Prediction tasks (zero-shot,
-probing) are written against this interface instead of taking a concrete
-model parameter, so any model implementing it can be plugged in.
+A benchmark "model" is the only thing that should be model-specific. Tasks are
+written against these interfaces, not against any concrete model, so a new model
+plugs in by implementing the minimal capability it supports.
+
+The capabilities are split so a model only implements what it can do:
+
+* ``BenchModel.forward`` is the base contract (run on canonical DNA, return a
+  generated sequence).
+* ``EmbeddingModel.embed`` powers embedding / probing tasks.
+* ``LikelihoodModel.predict_logits`` + ``vocab_index`` power likelihood tasks.
+
+All tasks pass and receive sequence as CANON ids (see ``CANON``). Each model
+owns the mapping from CANON to its own input/output vocab, so datasets stay
+model-agnostic.
 """
 
 from abc import ABC, abstractmethod
 
+# benchmark-wide canonical DNA alphabet. N is carried in-band so a window can
+# hold chromosome-edge padding without a separate mask. datasets emit ids in
+# this scheme; models translate to their own vocab inside the adapter.
+CANON = {"N": 0, "A": 1, "C": 2, "G": 3, "T": 4}
+
+
+class CapabilityError(TypeError):
+    """raised when a task is run against a model lacking a required capability."""
+
 
 class BenchModel(ABC):
-    """Base class every model wrapper in regdna-bench must implement.
-
-    Two capabilities cover the task families we care about first:
-
-    * ``forward`` powers *zero-shot* tasks: run the model on input
-      sequence(s) and return generated sequence output (e.g. an
-      autoregressively sampled continuation / predicted tokens).
-      Zero-shot scores are derived from this output.
-
-    * ``add_last_layer_embedding_extraction`` powers *probing* tasks:
-      arrange for the model's final-layer hidden representations to be
-      captured so a lightweight probe can be trained on frozen
-      embeddings.
-    """
+    """base class every model wrapper must implement."""
 
     @abstractmethod
-    def forward(self, sequence):
-        """Run the model and return a generated sequence.
+    def forward(self, windows):
+        """run the model and return a generated sequence.
 
         Args:
-            sequence: input DNA sequence(s) / context to condition on.
+            windows: (B, L) CANON token ids to condition on.
 
         Returns:
-            The model's generated sequence output. Consumed by
-            zero-shot tasks.
+            the model's generated sequence output (e.g. predicted tokens).
+        """
+        ...
+
+
+class EmbeddingModel(BenchModel):
+    """capability for embedding / probing tasks."""
+
+    @abstractmethod
+    def embed(self, windows):
+        """return last-layer hidden representations.
+
+        Args:
+            windows: (B, L) CANON token ids.
+
+        Returns:
+            (B, L, H) last-layer hidden states in fp32. tasks pool over L.
+        """
+        ...
+
+
+class LikelihoodModel(BenchModel):
+    """capability for likelihood-based zero-shot tasks."""
+
+    @abstractmethod
+    def predict_logits(self, windows):
+        """return per-position scores.
+
+        Args:
+            windows: (B, L) CANON token ids.
+
+        Returns:
+            (B, L, V) per-position scores over the model's output vocab.
         """
         ...
 
     @abstractmethod
-    def add_last_layer_embedding_extraction(self):
-        """Enable extraction of the model's last-layer embeddings.
-
-        Concrete implementations register whatever is needed (e.g. a
-        forward hook, or ``output_hidden_states=True``) so that the
-        final hidden-layer representation is available after
-        ``forward``. Consumed by probing tasks.
-        """
+    def vocab_index(self, canon_base):
+        """map a CANON base id (1-4) to its column in the predict_logits vocab."""
         ...

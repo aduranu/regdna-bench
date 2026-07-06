@@ -24,7 +24,7 @@ REPO="$SLURM_SUBMIT_DIR"
 OUT_JSON="$REPO/results/embedding_zero_shot/results_embedding_by_class.json"
 mkdir -p "$(dirname "$OUT_JSON")"
 
-PYTHONPATH="$REPO/src" python examples/d3/run_variant_vep_by_class.py \
+python examples/d3/run.py \
     --method embedding \
     --variants "$REPO/data/caqtl/Afr.CaQTLS.tsv" \
     --out "$OUT_JSON"

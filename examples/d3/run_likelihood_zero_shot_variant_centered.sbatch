@@ -25,7 +25,7 @@ REPO="$SLURM_SUBMIT_DIR"
 OUT_JSON="$REPO/results/likelihood_zero_shot_variant_centered/results_likelihood_by_class.json"
 mkdir -p "$(dirname "$OUT_JSON")"
 
-PYTHONPATH="$REPO/src" python examples/d3/run_variant_vep_by_class.py \
+python examples/d3/run.py \
     --method likelihood \
     --window-mode variant \
     --variants "$REPO/data/caqtl/Afr.CaQTLS.tsv" \

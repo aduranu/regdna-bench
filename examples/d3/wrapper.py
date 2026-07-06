@@ -1,16 +1,16 @@
-"""D3 (DNA discrete diffusion) wrapper implementing the regdna-bench BenchModel.
+"""D3 (DNA discrete diffusion) adapter implementing the regdna-bench model interface.
 
-example adapter showing how a diffusion model plugs into the benchmark. D3 is
-not autoregressive, so two D3-specific choices are made here and documented:
+example of how a diffusion model plugs into the benchmark. D3 is not
+autoregressive, so two D3-specific choices are made here and documented:
 
 - forward() runs a single denoising pass at a fixed noise level and returns the
-  model's predicted (argmax) tokens, to satisfy the "return a generated
-  sequence" contract. zero-shot variant scoring should read the denoising
-  logits instead (predict_logits), since a diffusion model has no autoregressive
-  continuation.
-- last-layer embeddings are captured with a forward hook on the final
-  transformer block. add_last_layer_embedding_extraction() installs the hook;
-  the result is read from .last_layer_embedding after each forward().
+  argmax tokens, to satisfy the "return a generated sequence" contract. zero-shot
+  variant scoring reads the denoising logits (predict_logits) instead.
+- embed() captures the final transformer block output with a forward hook.
+
+D3's input/output vocab is exactly the benchmark CANON alphabet {N:0,A:1,C:2,G:3,T:4}
+(it trained on the same zoonomia tokenization), so the CANON-to-vocab mapping is
+identity: windows pass straight through and vocab_index returns the base id.
 
 the only thing a caller must provide is a checkpoint: from_pretrained reads the
 config embedded in the checkpoint and derives the probing noise level from the
@@ -24,15 +24,12 @@ import contextlib
 
 import torch
 
-from regdna_bench.base import BenchModel
+from regdna_bench.base import EmbeddingModel, LikelihoodModel
 
-# the D3 backbone uses FlashAttention, which only supports fp16/bf16, so the
-# model forward must run under autocast (transformer -> bf16, per d3_dna's
-# precision policy). captured embeddings/logits are cast back to fp32 here.
+# the D3 backbone uses FlashAttention (fp16/bf16 only), so the forward runs under
+# autocast (transformer -> bf16, per d3_dna's precision policy). captured
+# embeddings/logits are cast back to fp32 here.
 EMBED_DTYPE = torch.float32
-
-DNA = ("A", "C", "G", "T")
-CHAR_TO_TOK = {c: i for i, c in enumerate(DNA)}
 
 
 # config lives inside PL checkpoints under hyper_parameters.cfg, so callers can
@@ -52,8 +49,8 @@ def _resolve_config(checkpoint, config, device):
     return OmegaConf.create(dict(hyper["cfg"]))
 
 
-class D3Model(BenchModel):
-    """benchmark wrapper around a loaded D3 TransformerModel (DDiT backbone)."""
+class D3Model(EmbeddingModel, LikelihoodModel):
+    """benchmark adapter around a loaded D3 TransformerModel (DDiT backbone)."""
 
     def __init__(self, model, config, noise=None, device="cuda", default_sigma=None,
                  autocast_dtype=None):
@@ -66,8 +63,8 @@ class D3Model(BenchModel):
         # (e.g. cpu debugging). from_pretrained sets it from the model config.
         self._autocast_dtype = autocast_dtype
 
-        # diffusion forward needs a noise level; autoregressive models would not.
-        # derive it from the model's own schedule unless caller pins one.
+        # diffusion forward needs a noise level; derive it from the model's own
+        # schedule unless caller pins one.
         if default_sigma is None:
             if noise is None:
                 raise ValueError("provide default_sigma, or a noise schedule to derive it from")
@@ -112,18 +109,10 @@ class D3Model(BenchModel):
 
         return float(sigmas[idx].item())
 
-    # accepts ACGT strings, numpy/torch (B, L) token ids, or (B, L, 4) one-hot
-    def _to_tokens(self, sequence):
-        if isinstance(sequence, str):
-            sequence = [sequence]
-
-        if isinstance(sequence, (list, tuple)):
-            return torch.tensor(
-                [[CHAR_TO_TOK[c] for c in s] for s in sequence],
-                dtype=torch.long, device=self._device,
-            )
-
-        tokens = torch.as_tensor(sequence)
+    # CANON ids in, D3 token tensor out. identity vocab, so this only moves the
+    # window onto the device; (B, L, 4) one-hot is accepted defensively.
+    def _to_tokens(self, windows):
+        tokens = torch.as_tensor(windows)
         if tokens.dim() == 3:
             tokens = tokens.argmax(dim=-1)
 
@@ -145,45 +134,42 @@ class D3Model(BenchModel):
         return torch.amp.autocast(device_type, dtype=self._autocast_dtype,
                                   enabled=(device_type == "cuda"))
 
-    # forward hook is a bound method (not a nested def) so it captures self
-    # without violating the no-nested-functions rule. block output is
-    # (B, L, hidden); probing pools over the length dimension.
-    def _capture_hook(self, _module, _inputs, output):
-        self._last_layer_embedding = output.detach().to(EMBED_DTYPE)
-
-    def forward(self, sequence):
-        tokens = self._to_tokens(sequence)
-        sigma = self._sigma_for(tokens.shape[0])
-
-        with torch.no_grad(), self._autocast():
-            logits, _rep = self._model(tokens, None, train=False, sigma=sigma)
-
-        # contract: return a generated sequence. for diffusion this is the
-        # single-step denoised prediction; use predict_logits for a continuous
-        # variant-effect score.
-        return logits.argmax(dim=-1)
-
-    def add_last_layer_embedding_extraction(self):
-        if self._hook_handle is not None:
-            return
-
-        self._hook_handle = self._model.blocks[-1].register_forward_hook(self._capture_hook)
-
-    # ---- extras consumed by tasks (beyond the minimal BenchModel ABC) ----
-
-    @property
-    def last_layer_embedding(self):
-        # populated by the capture hook after forward(); (B, L, hidden)
-        return self._last_layer_embedding
-
-    # denoising logits (B, L, vocab); zero-shot variant scoring reads these
-    # rather than forward()'s argmax tokens, since the diffusion model has no
-    # autoregressive likelihood to compare ref vs alt alleles directly.
-    def predict_logits(self, sequence):
-        tokens = self._to_tokens(sequence)
+    def _denoise(self, windows):
+        # shared single-step denoising pass; returns (logits, last-block output).
+        tokens = self._to_tokens(windows)
         sigma = self._sigma_for(tokens.shape[0])
 
         with torch.no_grad(), self._autocast():
             logits, _rep = self._model(tokens, None, train=False, sigma=sigma)
 
         return logits
+
+    def forward(self, windows):
+        # contract: return a generated sequence. for diffusion this is the
+        # single-step denoised prediction.
+        return self._denoise(windows).argmax(dim=-1)
+
+    # ---- EmbeddingModel ----
+
+    def _capture_hook(self, _module, _inputs, output):
+        self._last_layer_embedding = output.detach().to(EMBED_DTYPE)
+
+    def embed(self, windows):
+        if self._hook_handle is None:
+            self._hook_handle = self._model.blocks[-1].register_forward_hook(self._capture_hook)
+
+        self._denoise(windows)
+
+        return self._last_layer_embedding
+
+    # ---- LikelihoodModel ----
+
+    # denoising logits (B, L, vocab); zero-shot variant scoring reads these rather
+    # than forward()'s argmax tokens, since the diffusion model has no
+    # autoregressive likelihood to compare ref vs alt alleles directly.
+    def predict_logits(self, windows):
+        return self._denoise(windows)
+
+    # identity: D3's logit vocab is the CANON alphabet.
+    def vocab_index(self, canon_base):
+        return canon_base

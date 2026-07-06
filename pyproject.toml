@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regdna-bench"
+version = "0.1.0"
+description = "Generalizable benchmark for regulatory-DNA generative models"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+]
+
+# torch, pandas, zarr, h5py and the model backbones (e.g. d3_dna) are environment
+# provided: the core imports them lazily so a bare install stays light.
+[project.optional-dependencies]
+data = ["pandas", "zarr", "h5py"]
+
+[project.scripts]
+regdna-bench = "regdna_bench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
