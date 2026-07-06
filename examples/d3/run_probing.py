@@ -21,14 +21,14 @@ import h5py
 import numpy as np
 import torch
 
-# src/ holds regdna_bench + short_ctx_tasks; this dir holds the d3 wrapper.
+# src/ holds regdna_bench; this dir holds the d3 wrapper.
 # done before the project imports since the repo ships no installable package.
 _REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from wrapper import D3Model  # noqa: E402
-from short_ctx_tasks.probing import run_cnn_probing, run_probing  # noqa: E402
+from regdna_bench.tasks.short_ctx.probing import run_cnn_probing, run_probing  # noqa: E402
 
 
 def _load_split(h5_path, x_key, y_key):

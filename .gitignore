@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# downloaded datasets and run outputs
+/data/
+/results/
+/sbatch_out/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
