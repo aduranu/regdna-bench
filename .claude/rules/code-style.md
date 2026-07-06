@@ -22,9 +22,9 @@ These rules are mandatory. Follow them exactly when writing or editing Python co
 
 ## 2. Function Structure
 
-- **No nested function definitions**
+- **only use nested function definitions when absolutely necessary**
   - Use top-level helpers instead.
-- Keep functions flat and readable.
+- Try to keep functions flat and readable.
 
 ---
 
